@@ -57,7 +57,10 @@ step "architecture       $(uname -m)"
 # curl is fine (sudo opens /dev/tty), but an embedded or non-interactive
 # shell has neither, and sudo fails with an opaque error. Say so plainly.
 if ! sudo -n true 2>/dev/null; then
-  if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
+  # /dev/tty can be readable in an embedded shell even when sudo still cannot
+  # prompt through it, so test the streams instead. A real terminal always has
+  # at least one; `curl | bash` keeps stdout and stderr on the terminal.
+  if ! { [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; }; then
     die "sudo needs your password, but no terminal is attached to this shell.
 
   Run this in Terminal.app or iTerm instead:

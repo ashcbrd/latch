@@ -3,7 +3,7 @@
 Keep a MacBook fully awake with the lid closed.
 
 Close the laptop, put it in your bag, and your SSH sessions, builds, downloads
-and agent tasks keep running exactly as if the lid were open — while the screen
+and agent tasks keep running exactly as if the lid were open, while the screen
 stays dark and a watchdog makes sure you never come back to a machine that died
 at 0%.
 
@@ -23,12 +23,15 @@ latch  arming
 
 Because `caffeinate` does not survive a lid close.
 
-`caffeinate` holds an assertion against *idle* sleep. Closing the lid is a
-different signal entirely — macOS sleeps regardless, unless the machine is in
-clamshell mode with an external display attached.
+`caffeinate` creates a power assertion, which holds off *idle* sleep. Closing
+the lid is an explicit sleep request, and no assertion overrides it.
 
-The setting that actually defeats lid-close sleep is `pmset disablesleep`, and
-`latch` wraps it with the safety rails it badly needs.
+Apple's own closed-display mode does keep a Mac awake with the lid shut, but it
+requires the power adapter, an external display, and an external keyboard or
+mouse. That is a desk setup, not a bag.
+
+The setting that defeats lid-close sleep on its own is `pmset disablesleep`, and
+`latch` wraps it with the safety rails it needs.
 
 ## Install
 
@@ -94,7 +97,7 @@ latch off      # when you're back
 | --- | --- |
 | `pmset -a disablesleep 1` | The only thing that defeats **lid-close** sleep |
 | `caffeinate -dimsu` | Second layer against idle/disk sleep while open |
-| `pmset displaysleepnow` | Blanks the display immediately — no wasted power |
+| `pmset displaysleepnow` | Blanks the display three seconds after arming |
 | Watchdog process | Restores normal sleep below the battery floor |
 
 The watchdog polls every 60 seconds. If you are on battery and drop to 20% or
@@ -122,11 +125,12 @@ about exactly this state:
 
 `latch off` and `./uninstall.sh` both clear it unconditionally.
 
-**Teardown restores your machine's captured baseline**, not an assumed default.
-Settings are read before anything is changed, so if you already ran Low Power
-Mode, you still will afterwards.
+**Teardown records your Low Power Mode setting before changing it** and puts it
+back afterwards, so if you already ran Low Power Mode, you still will. Sleep
+itself is always re-enabled rather than restored, so the machine can never be
+left awake by mistake.
 
-**Heat is real but manageable.** Being awake is not what makes a laptop hot —
+**Heat is real but manageable.** Being awake is not what makes a laptop hot;
 sustained CPU load is. A closed lid restricts airflow, so:
 
 - Idle, SSH sessions, downloads, light agent work: fine, runs warm at most.
@@ -153,8 +157,8 @@ installed, because a malformed sudoers file can lock you out of `sudo`
 entirely.
 
 The honest tradeoff: any process running as your user can now toggle these
-power settings without a password. That is a low-value target — it cannot
-escalate to anything else — but it is a real widening of your sudo surface. Use
+power settings without a password. That is a low-value target, since it cannot
+escalate to anything else, but it is a real widening of your sudo surface. Use
 `./install.sh --no-sudoers` if you would rather type your password.
 
 ## Uninstall

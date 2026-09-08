@@ -1,0 +1,370 @@
+#!/bin/bash
+#
+# nosleep - keep a MacBook fully awake with the lid closed.
+#
+# Defeats lid-close sleep so long-running terminal sessions (SSH, Claude Code,
+# builds, downloads) keep running while the machine is shut and in a bag.
+# Blanks the display, arms a low-battery watchdog, and restores every setting
+# it touched on teardown.
+#
+# https://github.com/OWNER/nosleep
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+PMSET="/usr/bin/pmset"
+CAFFEINATE="/usr/bin/caffeinate"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nosleep"
+STATE_FILE="$STATE_DIR/state"
+CAFF_PID_FILE="$STATE_DIR/caffeinate.pid"
+WATCH_PID_FILE="$STATE_DIR/watchdog.pid"
+LOG_FILE="$STATE_DIR/nosleep.log"
+
+# Battery percentage at or below which the watchdog force-restores normal sleep.
+BATTERY_FLOOR="${NOSLEEP_BATTERY_FLOOR:-20}"
+# Seconds between watchdog polls.
+POLL_INTERVAL="${NOSLEEP_POLL_INTERVAL:-60}"
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------- utilities
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_BLUE=""
+fi
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+die() {
+  printf '%snosleep:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+
+info() { printf '  %s\n' "$*"; }
+
+# ------------------------------------------------------------ power queries
+
+# Current battery charge as an integer percentage.
+battery_percent() {
+  "$PMSET" -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -1 | tr -d '%'
+}
+
+# True when running on wall power rather than the internal battery.
+on_ac_power() {
+  "$PMSET" -g batt 2>/dev/null | grep -q "'AC Power'"
+}
+
+# True when sleep is currently suppressed system-wide.
+sleep_is_disabled() {
+  # pmset omits the SleepDisabled line entirely when the value is 0.
+  "$PMSET" -g 2>/dev/null | grep -Eq 'SleepDisabled[[:space:]]+1'
+}
+
+# Current low power mode setting (0 or 1).
+current_lowpowermode() {
+  local value
+  value="$("$PMSET" -g 2>/dev/null | grep -E '^[[:space:]]*lowpowermode' | awk '{print $2}')"
+  printf '%s' "${value:-0}"
+}
+
+# ------------------------------------------------------------------- state
+
+read_state() {
+  local key="$1"
+  [ -f "$STATE_FILE" ] || return 1
+  local line
+  line="$(grep -E "^${key}=" "$STATE_FILE" 2>/dev/null | head -1)" || return 1
+  [ -n "$line" ] || return 1
+  printf '%s' "${line#*=}"
+}
+
+is_armed() {
+  [ -f "$STATE_FILE" ]
+}
+
+# Read a stored pid and confirm the process is still alive.
+live_pid() {
+  local pid_file="$1" pid
+  [ -f "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null)" || return 1
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s' "$pid"
+}
+
+stop_pid_file() {
+  local pid_file="$1" pid
+  if pid="$(live_pid "$pid_file")"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+}
+
+# --------------------------------------------------------- privileged calls
+
+# All privileged calls go through here so the sudoers allowlist stays tiny and
+# every command that needs root is visible in one place.
+pm_root() {
+  if sudo -n "$PMSET" "$@" 2>/dev/null; then
+    return 0
+  fi
+  printf '%snosleep:%s needs sudo for: pmset %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+  sudo "$PMSET" "$@"
+}
+
+# --------------------------------------------------------------------- arm
+
+cmd_on() {
+  local cool=0 blank=1
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cool)     cool=1 ;;
+      --no-blank) blank=0 ;;
+      *) die "unknown option for 'on': $1" ;;
+    esac
+    shift
+  done
+
+  if is_armed; then
+    printf '%snosleep is already armed.%s Re-arming.\n\n' "$C_YELLOW" "$C_RESET"
+    teardown quiet
+  fi
+
+  mkdir -p "$STATE_DIR"
+
+  # Capture this machine's baseline BEFORE changing anything, so teardown
+  # restores what was actually here rather than an assumed default.
+  local baseline_lpm
+  baseline_lpm="$(current_lowpowermode)"
+
+  {
+    printf 'armed_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'baseline_lowpowermode=%s\n' "$baseline_lpm"
+    printf 'cool=%s\n' "$cool"
+    printf 'battery_floor=%s\n' "$BATTERY_FLOOR"
+  } >"$STATE_FILE"
+
+  printf '%s%snosleep%s  arming\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+
+  # 1. The one setting that actually defeats lid-close sleep.
+  pm_root -a disablesleep 1
+  info "lid-close sleep    ${C_GREEN}disabled${C_RESET}"
+
+  # 2. Low power mode, only if asked. Cuts thermals and extends runtime.
+  if [ "$cool" -eq 1 ]; then
+    pm_root -a lowpowermode 1
+    info "low power mode     ${C_GREEN}on${C_RESET} ${C_DIM}(cooler, slower)${C_RESET}"
+  fi
+
+  # 3. caffeinate as a second layer against idle/disk sleep while the lid is
+  #    still open. Detached so it outlives the terminal that started it.
+  nohup "$CAFFEINATE" -dimsu >/dev/null 2>&1 &
+  echo $! >"$CAFF_PID_FILE"
+  disown 2>/dev/null || true
+  info "idle assertion     ${C_GREEN}held${C_RESET} ${C_DIM}(caffeinate pid $(cat "$CAFF_PID_FILE"))${C_RESET}"
+
+  # 4. Watchdog: restores normal sleep if the battery gets dangerously low,
+  #    so an unattended machine in a bag never hard-crashes at 0%.
+  nohup "$SELF" __watchdog >/dev/null 2>&1 &
+  echo $! >"$WATCH_PID_FILE"
+  disown 2>/dev/null || true
+  info "battery watchdog   ${C_GREEN}armed${C_RESET} ${C_DIM}(restores sleep below ${BATTERY_FLOOR}%)${C_RESET}"
+
+  log "armed (cool=$cool, baseline_lowpowermode=$baseline_lpm, floor=$BATTERY_FLOOR)"
+
+  printf '\n  %sSafe to close the lid.%s Run %snosleep off%s when you are done.\n' \
+    "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+
+  if [ "$blank" -eq 1 ]; then
+    printf '  %sBlanking display in 3s (--no-blank to skip)...%s\n' "$C_DIM" "$C_RESET"
+    sleep 3
+    "$PMSET" displaysleepnow
+  fi
+}
+
+# ------------------------------------------------------------------ disarm
+
+# Restore everything this tool changed. Safe to run repeatedly.
+teardown() {
+  local mode="${1:-loud}"
+  local baseline_lpm
+
+  stop_pid_file "$WATCH_PID_FILE"
+  stop_pid_file "$CAFF_PID_FILE"
+
+  # Restore the machine's own captured baseline, falling back to 0 if the
+  # state file was lost (e.g. manual deletion after a crash).
+  baseline_lpm="$(read_state baseline_lowpowermode || printf '0')"
+
+  pm_root -a disablesleep 0
+  [ "$mode" = "loud" ] && info "lid-close sleep    ${C_GREEN}restored${C_RESET}"
+
+  if [ "$(current_lowpowermode)" != "$baseline_lpm" ]; then
+    pm_root -a lowpowermode "$baseline_lpm"
+    [ "$mode" = "loud" ] && info "low power mode     ${C_GREEN}restored to ${baseline_lpm}${C_RESET}"
+  fi
+
+  rm -f "$STATE_FILE"
+  log "disarmed (restored lowpowermode=$baseline_lpm)"
+  return 0
+}
+
+cmd_off() {
+  if ! is_armed && ! sleep_is_disabled; then
+    printf '%snosleep is not armed.%s Nothing to restore.\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  printf '%s%snosleep%s  restoring\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+  teardown loud
+  printf '\n  %sNormal sleep behaviour is back.%s\n' "$C_BOLD" "$C_RESET"
+}
+
+# ------------------------------------------------------------------ status
+
+cmd_status() {
+  local pct ac_state
+  pct="$(battery_percent)"
+  if on_ac_power; then ac_state="AC power"; else ac_state="battery"; fi
+
+  printf '%s%snosleep%s v%s\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET" "$VERSION"
+
+  if is_armed; then
+    printf '  state              %sARMED%s\n' "$C_GREEN" "$C_RESET"
+    printf '  armed at           %s\n' "$(read_state armed_at || echo unknown)"
+  else
+    printf '  state              %sinactive%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  if sleep_is_disabled; then
+    printf '  lid-close sleep    %sdisabled%s %s(safe to close)%s\n' "$C_GREEN" "$C_RESET" "$C_DIM" "$C_RESET"
+  else
+    printf '  lid-close sleep    %sactive%s %s(closing the lid WILL sleep)%s\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
+  fi
+
+  printf '  low power mode     %s\n' "$(current_lowpowermode)"
+
+  if live_pid "$CAFF_PID_FILE" >/dev/null; then
+    printf '  idle assertion     held %s(pid %s)%s\n' "$C_DIM" "$(cat "$CAFF_PID_FILE")" "$C_RESET"
+  else
+    printf '  idle assertion     %snot held%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  if live_pid "$WATCH_PID_FILE" >/dev/null; then
+    printf '  battery watchdog   armed %s(floor %s%%, pid %s)%s\n' \
+      "$C_DIM" "$(read_state battery_floor || echo "$BATTERY_FLOOR")" "$(cat "$WATCH_PID_FILE")" "$C_RESET"
+  else
+    printf '  battery watchdog   %snot running%s\n' "$C_DIM" "$C_RESET"
+  fi
+
+  printf '  power source       %s, %s%%\n' "$ac_state" "${pct:-?}"
+
+  # Warn about the dangerous half-state: sleep suppressed with nothing watching.
+  if sleep_is_disabled && ! is_armed; then
+    printf '\n  %sWarning:%s sleep is disabled but nosleep is not armed.\n' "$C_YELLOW" "$C_RESET"
+    printf '  Run %snosleep off%s to restore normal behaviour.\n' "$C_BOLD" "$C_RESET"
+  fi
+}
+
+# ---------------------------------------------------------------- watchdog
+
+# Background loop. Restores normal sleep when the battery runs low so an
+# unattended closed machine shuts down cleanly instead of dying at 0%.
+cmd_watchdog() {
+  log "watchdog started (floor=${BATTERY_FLOOR}%, interval=${POLL_INTERVAL}s)"
+
+  while true; do
+    sleep "$POLL_INTERVAL"
+
+    # Someone ran `nosleep off` (or cleared state); nothing left to guard.
+    if ! is_armed; then
+      log "watchdog exiting: no longer armed"
+      exit 0
+    fi
+
+    # Wall power means no battery risk.
+    on_ac_power && continue
+
+    local pct floor
+    pct="$(battery_percent)"
+    floor="$(read_state battery_floor || printf '%s' "$BATTERY_FLOOR")"
+
+    # Skip this tick if the reading was unparseable rather than acting on noise.
+    case "$pct" in
+      ''|*[!0-9]*) continue ;;
+    esac
+
+    if [ "$pct" -le "$floor" ]; then
+      log "watchdog TRIPPED at ${pct}% (floor ${floor}%) - restoring normal sleep"
+      teardown quiet
+      /usr/bin/osascript -e 'display notification "Battery low - normal sleep restored. Your Mac will now sleep when the lid is closed." with title "nosleep disarmed"' 2>/dev/null || true
+      exit 0
+    fi
+  done
+}
+
+# --------------------------------------------------------------------- cli
+
+cmd_help() {
+  cat <<'HELP'
+nosleep - keep your MacBook awake with the lid closed
+
+USAGE
+  nosleep [on] [--cool] [--no-blank]   Arm it. Safe to close the lid.
+  nosleep off                          Restore normal sleep behaviour.
+  nosleep status                       Show what is currently active.
+  nosleep log                          Tail the activity log.
+  nosleep help                         This message.
+
+OPTIONS
+  --cool        Also enable macOS Low Power Mode. Runs cooler and lasts
+                longer on battery, at the cost of some CPU speed. Worth it
+                if the machine is going in a bag under sustained load.
+  --no-blank    Leave the display on. By default the screen is blanked
+                three seconds after arming.
+
+ENVIRONMENT
+  NOSLEEP_BATTERY_FLOOR   Battery %% at which the watchdog restores normal
+                          sleep. Default: 20
+  NOSLEEP_POLL_INTERVAL   Watchdog poll interval in seconds. Default: 60
+
+NOTES
+  Disabling lid-close sleep is a persistent system setting that survives a
+  reboot. The battery watchdog and `nosleep off` both restore it. If you
+  ever suspect it was left on, `nosleep status` will tell you.
+
+  A closed lid restricts airflow. Idle or light work is fine; sustained
+  full-core load in a padded bag will get hot and thermally throttle.
+  Use --cool for that case.
+HELP
+}
+
+main() {
+  [ "$(uname -s)" = "Darwin" ] || die "this tool is macOS-only"
+
+  local cmd="${1:-on}"
+  [ $# -gt 0 ] && shift || true
+
+  case "$cmd" in
+    on)          cmd_on "$@" ;;
+    off|stop)    cmd_off ;;
+    status)      cmd_status ;;
+    log)         tail -n 40 "$LOG_FILE" 2>/dev/null || echo "no log yet" ;;
+    __watchdog)  cmd_watchdog ;;
+    help|-h|--help) cmd_help ;;
+    --cool|--no-blank) cmd_on "$cmd" "$@" ;;
+    version|-v|--version) echo "nosleep $VERSION" ;;
+    *) die "unknown command: $cmd (try 'nosleep help')" ;;
+  esac
+}
+
+main "$@"

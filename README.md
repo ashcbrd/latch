@@ -32,7 +32,29 @@ The setting that actually defeats lid-close sleep is `pmset disablesleep`, and
 
 ## Install
 
-Requires macOS. Works on both Apple Silicon and Intel.
+Requires macOS. Works on Apple Silicon and Intel.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ashcbrd/latch/main/install.sh | bash
+```
+
+That's it. No clone, no git, no GitHub account.
+
+The installer:
+
+1. Downloads `latch` and installs it to `/usr/local/bin`
+2. Installs a **validated, tightly scoped** sudoers rule so `latch` never
+   prompts for a password
+3. Verifies the installed command actually runs
+
+To skip the sudoers rule and be prompted for your password each time:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ashcbrd/latch/main/install.sh | bash -s -- --no-sudoers
+```
+
+<details>
+<summary>Installing from a clone instead</summary>
 
 ```sh
 git clone https://github.com/ashcbrd/latch.git
@@ -40,17 +62,11 @@ cd latch
 ./install.sh
 ```
 
-The installer:
+Installing from a clone symlinks the binary back into the checkout, so
+`git pull` updates your installed copy.
 
-1. Symlinks `latch` into `/usr/local/bin`
-2. Installs a **validated, tightly scoped** sudoers rule so `latch` runs
-   without a password prompt
+</details>
 
-Run `./install.sh --no-sudoers` to skip step 2 and be prompted for your
-password each time instead.
-
-Because the binary is a symlink back into the clone, `git pull` updates your
-installed copy.
 
 ## Usage
 

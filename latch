@@ -333,8 +333,8 @@ OPTIONS
                 three seconds after arming.
 
 ENVIRONMENT
-  LATCH_BATTERY_FLOOR   Battery %% at which the watchdog restores normal
-                          sleep. Default: 20
+  LATCH_BATTERY_FLOOR   Battery % at which the watchdog restores normal
+                        sleep. Default: 20
   LATCH_POLL_INTERVAL   Watchdog poll interval in seconds. Default: 60
 
 NOTES

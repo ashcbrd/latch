@@ -1,4 +1,4 @@
-# nosleep
+# latch
 
 Keep a MacBook fully awake with the lid closed.
 
@@ -8,15 +8,15 @@ stays dark and a watchdog makes sure you never come back to a machine that died
 at 0%.
 
 ```
-$ nosleep
+$ latch
 
-nosleep  arming
+latch  arming
 
   lid-close sleep    disabled
   idle assertion     held (caffeinate pid 48213)
   battery watchdog   armed (restores sleep below 20%)
 
-  Safe to close the lid. Run nosleep off when you are done.
+  Safe to close the lid. Run latch off when you are done.
 ```
 
 ## Why not just `caffeinate`?
@@ -28,22 +28,22 @@ different signal entirely — macOS sleeps regardless, unless the machine is in
 clamshell mode with an external display attached.
 
 The setting that actually defeats lid-close sleep is `pmset disablesleep`, and
-`nosleep` wraps it with the safety rails it badly needs.
+`latch` wraps it with the safety rails it badly needs.
 
 ## Install
 
 Requires macOS. Works on both Apple Silicon and Intel.
 
 ```sh
-git clone https://github.com/ashcbrd/nosleep.git
-cd nosleep
+git clone https://github.com/ashcbrd/latch.git
+cd latch
 ./install.sh
 ```
 
 The installer:
 
-1. Symlinks `nosleep` into `/usr/local/bin`
-2. Installs a **validated, tightly scoped** sudoers rule so `nosleep` runs
+1. Symlinks `latch` into `/usr/local/bin`
+2. Installs a **validated, tightly scoped** sudoers rule so `latch` runs
    without a password prompt
 
 Run `./install.sh --no-sudoers` to skip step 2 and be prompted for your
@@ -56,20 +56,20 @@ installed copy.
 
 | Command | What it does |
 | --- | --- |
-| `nosleep` | Arm it. Safe to close the lid. |
-| `nosleep --cool` | Arm it, plus Low Power Mode for cooler/longer running. |
-| `nosleep --no-blank` | Arm it but leave the display on. |
-| `nosleep off` | Restore normal sleep behaviour. |
-| `nosleep status` | Show what is currently active. |
-| `nosleep log` | Tail the activity log. |
+| `latch` | Arm it. Safe to close the lid. |
+| `latch --cool` | Arm it, plus Low Power Mode for cooler/longer running. |
+| `latch --no-blank` | Arm it but leave the display on. |
+| `latch off` | Restore normal sleep behaviour. |
+| `latch status` | Show what is currently active. |
+| `latch log` | Tail the activity log. |
 
 Typical run:
 
 ```sh
-nosleep          # screen blanks after 3s
+latch          # screen blanks after 3s
                  # close the lid, put it in your bag
                  # ...work from your phone over SSH...
-nosleep off      # when you're back
+latch off      # when you're back
 ```
 
 ## How it works
@@ -88,23 +88,23 @@ sleeps cleanly instead of hard-crashing at empty.
 Tune with environment variables:
 
 ```sh
-NOSLEEP_BATTERY_FLOOR=30 nosleep     # restore sleep below 30%
-NOSLEEP_POLL_INTERVAL=30 nosleep     # poll twice as often
+LATCH_BATTERY_FLOOR=30 latch     # restore sleep below 30%
+LATCH_POLL_INTERVAL=30 latch     # poll twice as often
 ```
 
 ## Things worth knowing
 
 **`disablesleep` is persistent and survives a reboot.** This is the single most
-important thing to understand. If something kills `nosleep` uncleanly, the
-setting stays on and your Mac will never sleep. `nosleep status` warns loudly
+important thing to understand. If something kills `latch` uncleanly, the
+setting stays on and your Mac will never sleep. `latch status` warns loudly
 about exactly this state:
 
 ```
-  Warning: sleep is disabled but nosleep is not armed.
-  Run nosleep off to restore normal behaviour.
+  Warning: sleep is disabled but latch is not armed.
+  Run latch off to restore normal behaviour.
 ```
 
-`nosleep off` and `./uninstall.sh` both clear it unconditionally.
+`latch off` and `./uninstall.sh` both clear it unconditionally.
 
 **Teardown restores your machine's captured baseline**, not an assumed default.
 Settings are read before anything is changed, so if you already ran Low Power

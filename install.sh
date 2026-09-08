@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Installer for nosleep.
+# Installer for latch.
 #
 #   ./install.sh              install
 #   ./install.sh --no-sudoers install without the passwordless sudo rule
@@ -8,10 +8,10 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$REPO_DIR/nosleep"
+SRC="$REPO_DIR/latch"
 BIN_DIR="/usr/local/bin"
-DEST="$BIN_DIR/nosleep"
-SUDOERS_FILE="/etc/sudoers.d/nosleep"
+DEST="$BIN_DIR/latch"
+SUDOERS_FILE="/etc/sudoers.d/latch"
 PMSET="/usr/bin/pmset"
 
 WANT_SUDOERS=1
@@ -28,12 +28,12 @@ step() { printf '  %s\n' "$*"; }
 ok()   { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-printf '\n%snosleep installer%s\n\n' "$C_BOLD" "$C_RESET"
+printf '\n%slatch installer%s\n\n' "$C_BOLD" "$C_RESET"
 
 # ------------------------------------------------------------ preflight
 
-[ "$(uname -s)" = "Darwin" ] || die "nosleep is macOS-only (found $(uname -s))"
-[ -f "$SRC" ]  || die "cannot find 'nosleep' next to this installer"
+[ "$(uname -s)" = "Darwin" ] || die "latch is macOS-only (found $(uname -s))"
+[ -f "$SRC" ]  || die "cannot find 'latch' next to this installer"
 [ -x "$PMSET" ] || die "$PMSET not found - is this really macOS?"
 
 USER_NAME="$(id -un)"
@@ -62,13 +62,13 @@ ok "linked $DEST -> $SRC"
 # -------------------------------------------------------------- sudoers
 
 if [ "$WANT_SUDOERS" -eq 1 ]; then
-  # Scope the passwordless rule to the four exact pmset invocations nosleep
+  # Scope the passwordless rule to the four exact pmset invocations latch
   # makes. No wildcards: a blanket `pmset *` would be a far wider grant.
   TMP_SUDOERS="$(mktemp)"
   trap 'rm -f "$TMP_SUDOERS"' EXIT
 
   cat >"$TMP_SUDOERS" <<SUDOERS
-# Installed by nosleep (https://github.com/ashcbrd/nosleep)
+# Installed by latch (https://github.com/ashcbrd/latch)
 # Allows $USER_NAME to toggle only these exact power settings without a
 # password. Remove with: sudo rm $SUDOERS_FILE
 $USER_NAME ALL=(root) NOPASSWD: $PMSET -a disablesleep 1, $PMSET -a disablesleep 0, $PMSET -a lowpowermode 1, $PMSET -a lowpowermode 0
@@ -79,7 +79,7 @@ SUDOERS
   if ! sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
     printf '\n%svalidation failed%s - refusing to install a broken sudoers file:\n\n' "$C_RED" "$C_RESET"
     sudo visudo -c -f "$TMP_SUDOERS" || true
-    die "sudoers rule not installed (nosleep will fall back to prompting for a password)"
+    die "sudoers rule not installed (latch will fall back to prompting for a password)"
   fi
 
   sudo install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS_FILE"
@@ -91,16 +91,16 @@ SUDOERS
     printf '  %s!%s rule installed but not yet active in this shell\n' "$C_YELLOW" "$C_RESET"
   fi
 else
-  step "skipping sudoers rule (nosleep will prompt for your password)"
+  step "skipping sudoers rule (latch will prompt for your password)"
 fi
 
 # ----------------------------------------------------------------- done
 
 printf '\n%sInstalled.%s\n\n' "$C_BOLD" "$C_RESET"
-printf '  %snosleep%s          arm it, then close the lid\n' "$C_BOLD" "$C_RESET"
-printf '  %snosleep --cool%s   same, but run cooler on battery\n' "$C_BOLD" "$C_RESET"
-printf '  %snosleep status%s   check what is active\n' "$C_BOLD" "$C_RESET"
-printf '  %snosleep off%s      restore normal sleep\n\n' "$C_BOLD" "$C_RESET"
+printf '  %slatch%s          arm it, then close the lid\n' "$C_BOLD" "$C_RESET"
+printf '  %slatch --cool%s   same, but run cooler on battery\n' "$C_BOLD" "$C_RESET"
+printf '  %slatch status%s   check what is active\n' "$C_BOLD" "$C_RESET"
+printf '  %slatch off%s      restore normal sleep\n\n' "$C_BOLD" "$C_RESET"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

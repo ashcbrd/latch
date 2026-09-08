@@ -25,14 +25,23 @@ if command -v latch >/dev/null 2>&1; then
   ok "restored normal sleep behaviour"
 fi
 
+# Stop leftover background processes even if `latch off` was unavailable.
+pkill -f 'latch __watchdog' 2>/dev/null || true
+
 # Belt and braces: clear the setting directly in case the script was broken.
 if /usr/bin/pmset -g | grep -Eq 'SleepDisabled[[:space:]]+1'; then
   sudo /usr/bin/pmset -a disablesleep 0
   ok "cleared lingering disablesleep"
 fi
 
-[ -L "$DEST" ] || [ -f "$DEST" ] && { sudo rm -f "$DEST"; ok "removed $DEST"; }
-[ -f "$SUDOERS_FILE" ] && { sudo rm -f "$SUDOERS_FILE"; ok "removed $SUDOERS_FILE"; }
-[ -d "$STATE_DIR" ] && { rm -rf "$STATE_DIR"; ok "removed $STATE_DIR"; }
+if [ -L "$DEST" ] || [ -f "$DEST" ]; then
+  sudo rm -f "$DEST"; ok "removed $DEST"
+fi
+if [ -f "$SUDOERS_FILE" ]; then
+  sudo rm -f "$SUDOERS_FILE"; ok "removed $SUDOERS_FILE"
+fi
+if [ -d "$STATE_DIR" ]; then
+  rm -rf "$STATE_DIR"; ok "removed $STATE_DIR"
+fi
 
 printf '\n%sUninstalled.%s The repo directory itself was left alone.\n\n' "$C_BOLD" "$C_RESET"

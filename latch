@@ -11,21 +11,28 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 PMSET="/usr/bin/pmset"
 CAFFEINATE="/usr/bin/caffeinate"
+OSASCRIPT="/usr/bin/osascript"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/latch"
 STATE_FILE="$STATE_DIR/state"
 CAFF_PID_FILE="$STATE_DIR/caffeinate.pid"
 WATCH_PID_FILE="$STATE_DIR/watchdog.pid"
 LOG_FILE="$STATE_DIR/latch.log"
+LOG_MAX_BYTES=524288
 
 # Battery percentage at or below which the watchdog force-restores normal sleep.
 BATTERY_FLOOR="${LATCH_BATTERY_FLOOR:-20}"
 # Seconds between watchdog polls.
 POLL_INTERVAL="${LATCH_POLL_INTERVAL:-60}"
+
+# Substrings used to confirm a stored pid still belongs to us before signalling
+# it. Pids are recycled, especially across reboots.
+CAFF_PID_MARK="caffeinate"
+WATCH_PID_MARK="__watchdog"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -40,6 +47,10 @@ fi
 
 log() {
   mkdir -p "$STATE_DIR"
+  # Keep the log bounded. Rotation is a truncate-to-tail, which is plenty here.
+  if [ -f "$LOG_FILE" ] && [ "$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)" -gt "$LOG_MAX_BYTES" ]; then
+    tail -n 500 "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null && mv -f "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
   printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
 }
 
@@ -48,13 +59,35 @@ die() {
   exit 1
 }
 
+warn() { printf '%slatch:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 info() { printf '  %s\n' "$*"; }
+
+has_tty() { [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; }
+
+notify() {
+  # Best effort. A background process may or may not reach the GUI session.
+  "$OSASCRIPT" -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+}
+
+# Refuse anything that is not a whole number; empty is also rejected.
+is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+validate_config() {
+  is_uint "$BATTERY_FLOOR" && [ "$BATTERY_FLOOR" -le 100 ] ||
+    die "LATCH_BATTERY_FLOOR must be a whole number from 0 to 100 (got '$BATTERY_FLOOR')"
+  is_uint "$POLL_INTERVAL" && [ "$POLL_INTERVAL" -ge 5 ] ||
+    die "LATCH_POLL_INTERVAL must be a whole number of at least 5 seconds (got '$POLL_INTERVAL')"
+}
 
 # ------------------------------------------------------------ power queries
 
-# Current battery charge as an integer percentage.
+# Current battery charge as an integer percentage. Empty when there is none.
 battery_percent() {
   "$PMSET" -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -1 | tr -d '%'
+}
+
+has_battery() {
+  "$PMSET" -g batt 2>/dev/null | grep -q 'InternalBattery'
 }
 
 # True when running on wall power rather than the internal battery.
@@ -64,8 +97,13 @@ on_ac_power() {
 
 # True when sleep is currently suppressed system-wide.
 sleep_is_disabled() {
-  # pmset omits the SleepDisabled line entirely when the value is 0.
+  # pmset omits the SleepDisabled line entirely until it has been set once.
   "$PMSET" -g 2>/dev/null | grep -Eq 'SleepDisabled[[:space:]]+1'
+}
+
+# Low Power Mode only exists on Apple silicon and a few late Intel notebooks.
+lowpowermode_supported() {
+  "$PMSET" -g 2>/dev/null | grep -Eq '^[[:space:]]*lowpowermode'
 }
 
 # Current low power mode setting (0 or 1).
@@ -86,38 +124,78 @@ read_state() {
   printf '%s' "${line#*=}"
 }
 
-is_armed() {
-  [ -f "$STATE_FILE" ]
+# A state file means an arm was recorded. It does not mean anything is running.
+state_exists() { [ -f "$STATE_FILE" ]; }
+
+# Confirm a pid is alive AND is the kind of process we started. Without the
+# second check a recycled pid could get an unrelated process killed.
+pid_is_ours() {
+  local pid="$1" mark="$2" cmd
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+  case "$cmd" in *"$mark"*) return 0 ;; *) return 1 ;; esac
 }
 
-# Read a stored pid and confirm the process is still alive.
+# Print a stored pid if it still refers to our live process.
 live_pid() {
-  local pid_file="$1" pid
+  local pid_file="$1" mark="$2" pid
   [ -f "$pid_file" ] || return 1
   pid="$(cat "$pid_file" 2>/dev/null)" || return 1
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  is_uint "$pid" || return 1
+  pid_is_ours "$pid" "$mark" || return 1
   printf '%s' "$pid"
 }
 
 stop_pid_file() {
-  local pid_file="$1" pid
-  if pid="$(live_pid "$pid_file")"; then
-    kill "$pid" 2>/dev/null || true
+  local pid_file="$1" mark="$2" pid
+  if pid="$(live_pid "$pid_file" "$mark")"; then
+    # The watchdog runs teardown on itself when it trips. Signalling our own
+    # pid here would kill it before sleep is restored, so never do that.
+    if [ "$pid" != "$$" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
   fi
   rm -f "$pid_file"
 }
 
+# Fully armed means the watchdog we rely on is actually alive.
+watchdog_alive()   { live_pid "$WATCH_PID_FILE" "$WATCH_PID_MARK" >/dev/null; }
+caffeinate_alive() { live_pid "$CAFF_PID_FILE" "$CAFF_PID_MARK" >/dev/null; }
+
 # --------------------------------------------------------- privileged calls
 
+# Whether the sudoers rule lets us change power settings with no password and
+# no terminal. `sudo -l <cmd>` is the wrong probe: it answers "permitted at
+# all", and an admin is permitted everything with a password. Read the actual
+# rule list and look for our NOPASSWD entry instead.
+can_root_unattended() {
+  sudo -n -l 2>/dev/null | grep -q 'NOPASSWD:.*disablesleep 0'
+}
+
 # All privileged calls go through here so the sudoers allowlist stays tiny and
-# every command that needs root is visible in one place.
+# every command that needs root is visible in one place. Returns non-zero on
+# failure instead of exiting, so callers can roll back.
 pm_root() {
-  if sudo -n "$PMSET" "$@" 2>/dev/null; then
+  local err
+  if err="$(sudo -n "$PMSET" "$@" 2>&1)"; then
     return 0
   fi
-  printf '%slatch:%s needs sudo for: pmset %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
-  sudo "$PMSET" "$@"
+
+  # Distinguish "sudo wants a password" from "pmset itself rejected this".
+  case "$err" in
+    *password*)
+      if ! has_tty; then
+        warn "pmset $* needs sudo, and no terminal is attached to ask for a password"
+        return 1
+      fi
+      printf '%slatch:%s needs sudo for: pmset %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+      sudo "$PMSET" "$@"
+      ;;
+    *)
+      warn "pmset $* failed: ${err:-unknown error}"
+      return 1
+      ;;
+  esac
 }
 
 # --------------------------------------------------------------------- arm
@@ -129,12 +207,29 @@ cmd_on() {
     case "$1" in
       --cool)     cool=1 ;;
       --no-blank) blank=0 ;;
-      *) die "unknown option for 'on': $1" ;;
+      *) die "unknown option for 'on': $1 (try 'latch help')" ;;
     esac
     shift
   done
 
-  if is_armed; then
+  validate_config
+
+  if [ "$cool" -eq 1 ] && ! lowpowermode_supported; then
+    warn "this Mac does not support Low Power Mode; ignoring --cool"
+    cool=0
+  fi
+
+  # Arming below the floor on battery would be undone at the first poll.
+  # Say so now instead of pretending it worked for sixty seconds.
+  if has_battery && ! on_ac_power; then
+    local pct
+    pct="$(battery_percent)"
+    if is_uint "$pct" && [ "$pct" -le "$BATTERY_FLOOR" ]; then
+      die "battery is at ${pct}%, at or below the ${BATTERY_FLOOR}% floor. Plug in, or lower LATCH_BATTERY_FLOOR."
+    fi
+  fi
+
+  if state_exists; then
     printf '%slatch is already armed.%s Re-arming.\n\n' "$C_YELLOW" "$C_RESET"
     teardown quiet
   fi
@@ -146,28 +241,39 @@ cmd_on() {
   local baseline_lpm
   baseline_lpm="$(current_lowpowermode)"
 
+  local unattended=1
+  can_root_unattended || unattended=0
+
+  printf '%s%slatch%s  arming\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+
+  # 1. The one setting that actually defeats lid-close sleep.
+  pm_root -a disablesleep 1 || die "could not disable sleep; nothing was changed"
+  info "lid-close sleep    ${C_GREEN}disabled${C_RESET}"
+
+  # 2. Low power mode, only if asked. Roll back step 1 if this fails so the
+  #    machine is never left half-configured.
+  if [ "$cool" -eq 1 ]; then
+    if ! pm_root -a lowpowermode 1; then
+      pm_root -a disablesleep 0 || true
+      die "could not enable Low Power Mode; sleep has been re-enabled"
+    fi
+    info "low power mode     ${C_GREEN}on${C_RESET} ${C_DIM}(cooler, slower)${C_RESET}"
+  fi
+
+  # State is written only after every privileged change succeeded, so a state
+  # file always describes a real arm.
   {
     printf 'armed_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf 'baseline_lowpowermode=%s\n' "$baseline_lpm"
     printf 'cool=%s\n' "$cool"
     printf 'battery_floor=%s\n' "$BATTERY_FLOOR"
+    printf 'poll_interval=%s\n' "$POLL_INTERVAL"
   } >"$STATE_FILE"
 
-  printf '%s%slatch%s  arming\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
-
-  # 1. The one setting that actually defeats lid-close sleep.
-  pm_root -a disablesleep 1
-  info "lid-close sleep    ${C_GREEN}disabled${C_RESET}"
-
-  # 2. Low power mode, only if asked. Cuts thermals and extends runtime.
-  if [ "$cool" -eq 1 ]; then
-    pm_root -a lowpowermode 1
-    info "low power mode     ${C_GREEN}on${C_RESET} ${C_DIM}(cooler, slower)${C_RESET}"
-  fi
-
-  # 3. caffeinate as a second layer against idle/disk sleep while the lid is
-  #    still open. Detached so it outlives the terminal that started it.
-  nohup "$CAFFEINATE" -dimsu >/dev/null 2>&1 &
+  # 3. caffeinate as a second layer against idle system and disk sleep.
+  #    Deliberately NOT -d or -u: those keep the display awake (and -u turns
+  #    it back on), which is the opposite of what we want.
+  nohup "$CAFFEINATE" -ims >/dev/null 2>&1 &
   echo $! >"$CAFF_PID_FILE"
   disown 2>/dev/null || true
   info "idle assertion     ${C_GREEN}held${C_RESET} ${C_DIM}(caffeinate pid $(cat "$CAFF_PID_FILE"))${C_RESET}"
@@ -177,9 +283,19 @@ cmd_on() {
   nohup "$SELF" __watchdog >/dev/null 2>&1 &
   echo $! >"$WATCH_PID_FILE"
   disown 2>/dev/null || true
-  info "battery watchdog   ${C_GREEN}armed${C_RESET} ${C_DIM}(restores sleep below ${BATTERY_FLOOR}%)${C_RESET}"
+  if [ "$unattended" -eq 1 ]; then
+    info "battery watchdog   ${C_GREEN}armed${C_RESET} ${C_DIM}(restores sleep at ${BATTERY_FLOOR}%)${C_RESET}"
+  else
+    info "battery watchdog   ${C_YELLOW}armed, but cannot restore sleep unattended${C_RESET}"
+  fi
 
-  log "armed (cool=$cool, baseline_lowpowermode=$baseline_lpm, floor=$BATTERY_FLOOR)"
+  log "armed (cool=$cool, baseline_lowpowermode=$baseline_lpm, floor=$BATTERY_FLOOR, interval=$POLL_INTERVAL, unattended=$unattended)"
+
+  if [ "$unattended" -eq 0 ]; then
+    printf '\n  %sWarning:%s the passwordless sudo rule is not installed, so the watchdog\n' "$C_YELLOW" "$C_RESET"
+    printf '  cannot re-enable sleep on its own when the battery runs low. It will\n'
+    printf '  notify you instead. Run %s./install.sh%s to fix this.\n' "$C_BOLD" "$C_RESET"
+  fi
 
   printf '\n  %sSafe to close the lid.%s Run %slatch off%s when you are done.\n' \
     "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
@@ -193,54 +309,87 @@ cmd_on() {
 
 # ------------------------------------------------------------------ disarm
 
-# Restore everything this tool changed. Safe to run repeatedly.
+# Restore everything this tool changed. Safe to run repeatedly. Returns
+# non-zero only if sleep could not be re-enabled.
 teardown() {
   local mode="${1:-loud}"
-  local baseline_lpm
+  local baseline_lpm="" ok=0
 
-  stop_pid_file "$WATCH_PID_FILE"
-  stop_pid_file "$CAFF_PID_FILE"
+  stop_pid_file "$WATCH_PID_FILE" "$WATCH_PID_MARK"
+  stop_pid_file "$CAFF_PID_FILE" "$CAFF_PID_MARK"
 
-  # Restore the machine's own captured baseline, falling back to 0 if the
-  # state file was lost (e.g. manual deletion after a crash).
-  baseline_lpm="$(read_state baseline_lowpowermode || printf '0')"
-
-  pm_root -a disablesleep 0
-  [ "$mode" = "loud" ] && info "lid-close sleep    ${C_GREEN}restored${C_RESET}"
-
-  if [ "$(current_lowpowermode)" != "$baseline_lpm" ]; then
-    pm_root -a lowpowermode "$baseline_lpm"
-    [ "$mode" = "loud" ] && info "low power mode     ${C_GREEN}restored to ${baseline_lpm}${C_RESET}"
+  if pm_root -a disablesleep 0; then
+    [ "$mode" = "loud" ] && info "lid-close sleep    ${C_GREEN}restored${C_RESET}"
+  else
+    ok=1
+    [ "$mode" = "loud" ] && info "lid-close sleep    ${C_RED}NOT restored${C_RESET}"
   fi
 
-  rm -f "$STATE_FILE"
-  log "disarmed (restored lowpowermode=$baseline_lpm)"
-  return 0
+  # Only touch Low Power Mode when we know what it was. With no state file we
+  # have no baseline, and guessing 0 would clobber a user who runs it on purpose.
+  if baseline_lpm="$(read_state baseline_lowpowermode)"; then
+    if [ "$(current_lowpowermode)" != "$baseline_lpm" ]; then
+      if pm_root -a lowpowermode "$baseline_lpm"; then
+        [ "$mode" = "loud" ] && info "low power mode     ${C_GREEN}restored to ${baseline_lpm}${C_RESET}"
+      else
+        [ "$mode" = "loud" ] && info "low power mode     ${C_RED}NOT restored${C_RESET}"
+      fi
+    fi
+  fi
+
+  if [ "$ok" -eq 0 ]; then
+    rm -f "$STATE_FILE"
+    log "disarmed (lowpowermode baseline=${baseline_lpm:-unknown})"
+  else
+    # Keep the state file so `status` keeps warning until this is fixed.
+    log "disarm FAILED: sleep is still disabled"
+  fi
+  return "$ok"
 }
 
 cmd_off() {
-  if ! is_armed && ! sleep_is_disabled; then
+  [ $# -eq 0 ] || die "'off' takes no arguments"
+
+  if ! state_exists && ! sleep_is_disabled; then
+    # Nothing to undo, but sweep any stale pid files from a crash or reboot.
+    stop_pid_file "$CAFF_PID_FILE" "$CAFF_PID_MARK"
+    stop_pid_file "$WATCH_PID_FILE" "$WATCH_PID_MARK"
     printf '%slatch is not armed.%s Nothing to restore.\n' "$C_DIM" "$C_RESET"
     return 0
   fi
 
   printf '%s%slatch%s  restoring\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
-  teardown loud
-  printf '\n  %sNormal sleep behaviour is back.%s\n' "$C_BOLD" "$C_RESET"
+  if teardown loud; then
+    printf '\n  %sNormal sleep behaviour is back.%s\n' "$C_BOLD" "$C_RESET"
+  else
+    printf '\n  %sSleep is still disabled.%s Run this again from a terminal that can sudo.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
 }
 
 # ------------------------------------------------------------------ status
 
+# Exit status: 0 normal, 1 when sleep is disabled with nothing guarding it.
 cmd_status() {
-  local pct ac_state
-  pct="$(battery_percent)"
-  if on_ac_power; then ac_state="AC power"; else ac_state="battery"; fi
+  [ $# -eq 0 ] || die "'status' takes no arguments"
+
+  local pct ac_state rc=0
+  if has_battery; then
+    pct="$(battery_percent)"
+    if on_ac_power; then ac_state="AC power"; else ac_state="battery"; fi
+    ac_state="$ac_state, ${pct:-?}%"
+  else
+    ac_state="AC power, no battery"
+  fi
 
   printf '%s%slatch%s v%s\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET" "$VERSION"
 
-  if is_armed; then
+  if state_exists && watchdog_alive; then
     printf '  state              %sARMED%s\n' "$C_GREEN" "$C_RESET"
     printf '  armed at           %s\n' "$(read_state armed_at || echo unknown)"
+  elif state_exists; then
+    printf '  state              %sARMED (stale)%s %s(watchdog not running, likely a reboot)%s\n' \
+      "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
   else
     printf '  state              %sinactive%s\n' "$C_DIM" "$C_RESET"
   fi
@@ -251,28 +400,43 @@ cmd_status() {
     printf '  lid-close sleep    %sactive%s %s(closing the lid WILL sleep)%s\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
   fi
 
-  printf '  low power mode     %s\n' "$(current_lowpowermode)"
+  if lowpowermode_supported; then
+    printf '  low power mode     %s\n' "$(current_lowpowermode)"
+  else
+    printf '  low power mode     %sunsupported%s\n' "$C_DIM" "$C_RESET"
+  fi
 
-  if live_pid "$CAFF_PID_FILE" >/dev/null; then
+  if caffeinate_alive; then
     printf '  idle assertion     held %s(pid %s)%s\n' "$C_DIM" "$(cat "$CAFF_PID_FILE")" "$C_RESET"
   else
     printf '  idle assertion     %snot held%s\n' "$C_DIM" "$C_RESET"
   fi
 
-  if live_pid "$WATCH_PID_FILE" >/dev/null; then
-    printf '  battery watchdog   armed %s(floor %s%%, pid %s)%s\n' \
-      "$C_DIM" "$(read_state battery_floor || echo "$BATTERY_FLOOR")" "$(cat "$WATCH_PID_FILE")" "$C_RESET"
+  if watchdog_alive; then
+    printf '  battery watchdog   armed %s(floor %s%%, every %ss, pid %s)%s\n' \
+      "$C_DIM" "$(read_state battery_floor || echo "$BATTERY_FLOOR")" \
+      "$(read_state poll_interval || echo "$POLL_INTERVAL")" "$(cat "$WATCH_PID_FILE")" "$C_RESET"
   else
     printf '  battery watchdog   %snot running%s\n' "$C_DIM" "$C_RESET"
   fi
 
-  printf '  power source       %s, %s%%\n' "$ac_state" "${pct:-?}"
-
-  # Warn about the dangerous half-state: sleep suppressed with nothing watching.
-  if sleep_is_disabled && ! is_armed; then
-    printf '\n  %sWarning:%s sleep is disabled but latch is not armed.\n' "$C_YELLOW" "$C_RESET"
-    printf '  Run %slatch off%s to restore normal behaviour.\n' "$C_BOLD" "$C_RESET"
+  if can_root_unattended; then
+    printf '  unattended sudo    %sok%s\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '  unattended sudo    %smissing%s %s(watchdog cannot restore sleep by itself)%s\n' \
+      "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
   fi
+
+  printf '  power source       %s\n' "$ac_state"
+
+  # The dangerous state: sleep suppressed with nothing watching the battery.
+  if sleep_is_disabled && ! watchdog_alive; then
+    rc=1
+    printf '\n  %sWarning:%s sleep is disabled and no watchdog is running.\n' "$C_YELLOW" "$C_RESET"
+    printf '  Run %slatch off%s to restore normal behaviour, or %slatch%s to re-arm.\n' \
+      "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+  fi
+  return "$rc"
 }
 
 # ---------------------------------------------------------------- watchdog
@@ -280,13 +444,19 @@ cmd_status() {
 # Background loop. Restores normal sleep when the battery runs low so an
 # unattended closed machine shuts down cleanly instead of dying at 0%.
 cmd_watchdog() {
-  log "watchdog started (floor=${BATTERY_FLOOR}%, interval=${POLL_INTERVAL}s)"
+  local floor interval
+  floor="$(read_state battery_floor || printf '%s' "$BATTERY_FLOOR")"
+  interval="$(read_state poll_interval || printf '%s' "$POLL_INTERVAL")"
+  is_uint "$floor" || floor=20
+  is_uint "$interval" || interval=60
+
+  log "watchdog started (pid $$, floor=${floor}%, interval=${interval}s)"
 
   while true; do
-    sleep "$POLL_INTERVAL"
+    sleep "$interval"
 
     # Someone ran `latch off` (or cleared state); nothing left to guard.
-    if ! is_armed; then
+    if ! state_exists; then
       log "watchdog exiting: no longer armed"
       exit 0
     fi
@@ -294,19 +464,21 @@ cmd_watchdog() {
     # Wall power means no battery risk.
     on_ac_power && continue
 
-    local pct floor
+    local pct
     pct="$(battery_percent)"
-    floor="$(read_state battery_floor || printf '%s' "$BATTERY_FLOOR")"
 
     # Skip this tick if the reading was unparseable rather than acting on noise.
-    case "$pct" in
-      ''|*[!0-9]*) continue ;;
-    esac
+    is_uint "$pct" || continue
 
     if [ "$pct" -le "$floor" ]; then
       log "watchdog TRIPPED at ${pct}% (floor ${floor}%) - restoring normal sleep"
-      teardown quiet
-      /usr/bin/osascript -e 'display notification "Battery low - normal sleep restored. Your Mac will now sleep when the lid is closed." with title "latch disarmed"' 2>/dev/null || true
+      if teardown quiet; then
+        notify "latch disarmed" "Battery at ${pct}%. Normal sleep restored; your Mac will now sleep when closed."
+      else
+        # Could not get root (no passwordless rule). Shed what we can and shout.
+        log "watchdog could NOT restore sleep (no unattended sudo); caffeinate stopped"
+        notify "latch needs you" "Battery at ${pct}% and sleep is still disabled. Open the lid and run: latch off"
+      fi
       exit 0
     fi
   done
@@ -329,18 +501,28 @@ OPTIONS
   --cool        Also enable macOS Low Power Mode. Runs cooler and lasts
                 longer on battery, at the cost of some CPU speed. Worth it
                 if the machine is going in a bag under sustained load.
+                Ignored on Macs without Low Power Mode.
   --no-blank    Leave the display on. By default the screen is blanked
                 three seconds after arming.
 
 ENVIRONMENT
   LATCH_BATTERY_FLOOR   Battery % at which the watchdog restores normal
-                        sleep. Default: 20
-  LATCH_POLL_INTERVAL   Watchdog poll interval in seconds. Default: 60
+                        sleep (0-100). Default: 20
+  LATCH_POLL_INTERVAL   Watchdog poll interval in seconds (min 5).
+                        Default: 60
+
+EXIT STATUS
+  status  0 when healthy, 1 when sleep is disabled with no watchdog running.
+  off     0 when sleep was restored, 1 when it could not be.
 
 NOTES
   Disabling lid-close sleep is a persistent system setting that survives a
-  reboot. The battery watchdog and `latch off` both restore it. If you
-  ever suspect it was left on, `latch status` will tell you.
+  reboot. The battery watchdog does not: after a restart, sleep stays
+  disabled and nothing is watching the battery until you run `latch` or
+  `latch off`. `latch status` reports this as ARMED (stale).
+
+  The watchdog needs the passwordless sudo rule from install.sh to restore
+  sleep on its own. Without it, it can only notify you.
 
   A closed lid restricts airflow. Idle or light work is fine; sustained
   full-core load in a padded bag will get hot and thermally throttle.
@@ -350,15 +532,17 @@ HELP
 
 main() {
   [ "$(uname -s)" = "Darwin" ] || die "this tool is macOS-only"
+  [ "$(id -u)" -ne 0 ] || die "run latch as your normal user, not as root; it asks for sudo only where needed"
 
   local cmd="${1:-on}"
   [ $# -gt 0 ] && shift || true
 
   case "$cmd" in
     on)          cmd_on "$@" ;;
-    off|stop)    cmd_off ;;
-    status)      cmd_status ;;
-    log)         tail -n 40 "$LOG_FILE" 2>/dev/null || echo "no log yet" ;;
+    off|stop)    cmd_off "$@" ;;
+    status)      cmd_status "$@" ;;
+    log)         [ $# -eq 0 ] || die "'log' takes no arguments"
+                 tail -n 40 "$LOG_FILE" 2>/dev/null || echo "no log yet" ;;
     __watchdog)  cmd_watchdog ;;
     help|-h|--help) cmd_help ;;
     --cool|--no-blank) cmd_on "$cmd" "$@" ;;

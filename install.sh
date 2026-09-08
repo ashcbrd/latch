@@ -160,6 +160,8 @@ SUDOERS
   fi
 else
   step "skipping sudoers rule - latch will prompt for your password"
+  printf '\n  %sNote:%s without the rule, the battery watchdog cannot re-enable sleep\n' "$C_YELLOW" "$C_RESET"
+  printf '  on its own when running unattended. It will notify you instead.\n'
 fi
 
 # ----------------------------------------------------------- verify

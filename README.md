@@ -14,7 +14,7 @@ latch  arming
 
   lid-close sleep    disabled
   idle assertion     held (caffeinate pid 48213)
-  battery watchdog   armed (restores sleep below 20%)
+  battery watchdog   armed (restores sleep at 20%)
 
   Safe to close the lid. Run latch off when you are done.
 ```
@@ -82,6 +82,9 @@ Installing from a clone symlinks the binary back into the checkout, so
 | `latch status` | Show what is currently active. |
 | `latch log` | Tail the activity log. |
 
+Exit status: `latch status` returns 1 when sleep is disabled with no watchdog
+running. `latch off` returns 1 if sleep could not be restored.
+
 Typical run:
 
 ```sh
@@ -98,7 +101,10 @@ latch off      # when you're back
 | `pmset -a disablesleep 1` | The only thing that defeats **lid-close** sleep |
 | `caffeinate -dimsu` | Second layer against idle/disk sleep while open |
 | `pmset displaysleepnow` | Blanks the display three seconds after arming |
-| Watchdog process | Restores normal sleep below the battery floor |
+| Watchdog process | Restores normal sleep at the battery floor |
+
+`caffeinate` is run as `-ims` on purpose. The `-d` and `-u` flags keep the
+display awake (and `-u` turns it back on), which is the opposite of the goal.
 
 The watchdog polls every 60 seconds. If you are on battery and drop to 20% or
 below, it restores normal sleep and posts a macOS notification, so the machine
@@ -129,6 +135,20 @@ about exactly this state:
 back afterwards, so if you already ran Low Power Mode, you still will. Sleep
 itself is always re-enabled rather than restored, so the machine can never be
 left awake by mistake.
+
+**The watchdog needs the passwordless sudo rule.** It runs in the background
+with no terminal, so it cannot type a password. Without the rule from
+`install.sh` it can only send a notification when the battery runs low.
+`latch status` shows `unattended sudo` so you can tell which situation you are
+in.
+
+**The watchdog does not survive a reboot.** `disablesleep` does. After a
+restart, sleep stays disabled and nothing is watching the battery until you run
+`latch` or `latch off`. `latch status` reports this as `ARMED (stale)` and exits
+with status 1, so it is easy to check from a script or a shell prompt.
+
+**latch refuses to arm below the floor.** If you are on battery at or under the
+floor, arming would be undone at the first poll, so it says so up front instead.
 
 **Heat is real but manageable.** Being awake is not what makes a laptop hot;
 sustained CPU load is. A closed lid restricts airflow, so:

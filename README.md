@@ -2,8 +2,6 @@
 
 Keep a MacBook fully awake with the lid closed.
 
-**[ashcbrd.github.io/latch](https://ashcbrd.github.io/latch/)**
-
 Close the laptop, put it in your bag, and your SSH sessions, builds, downloads
 and agent tasks keep running exactly as if the lid were open — while the screen
 stays dark and a watchdog makes sure you never come back to a machine that died

@@ -147,7 +147,10 @@ SUDOERS
   rm -f "$TMP_SUDOERS"
   ok "installed $SUDOERS_FILE ${C_DIM}(validated)${C_RESET}"
 
-  if sudo -n "$PMSET" -g >/dev/null 2>&1; then
+  # Probe with an allowlisted command. `pmset -g` is deliberately NOT in the
+  # rule, so testing with it always fails and reports a false negative.
+  # `disablesleep 0` is in the rule and is a no-op on a machine that is not armed.
+  if sudo -n "$PMSET" -a disablesleep 0 >/dev/null 2>&1; then
     ok "passwordless pmset confirmed"
   else
     printf '  %s!%s rule installed but not active in this shell yet\n' "$C_YELLOW" "$C_RESET"

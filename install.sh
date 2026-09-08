@@ -53,6 +53,21 @@ step "user               $USER_NAME"
 step "macOS              $(sw_vers -productVersion)"
 step "architecture       $(uname -m)"
 
+# sudo needs a controlling terminal to prompt for a password. Piping from
+# curl is fine (sudo opens /dev/tty), but an embedded or non-interactive
+# shell has neither, and sudo fails with an opaque error. Say so plainly.
+if ! sudo -n true 2>/dev/null; then
+  if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
+    die "sudo needs your password, but no terminal is attached to this shell.
+
+  Run this in Terminal.app or iTerm instead:
+    cd $(pwd) && ./install.sh
+
+  Or install without the passwordless rule (still needs sudo for /usr/local/bin):
+    ./install.sh --no-sudoers"
+  fi
+fi
+
 # When piped from curl there is no script on disk, so BASH_SOURCE is not a
 # usable path. Fall back to downloading the payload in that case.
 SRC=""
